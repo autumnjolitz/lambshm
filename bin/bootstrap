@@ -1,0 +1,59 @@
+#!/usr/bin/env sh
+
+
+set -o pipefail  # ARJ: ignore if this doesn't exist
+set -eu
+
+args="${@:-}"
+SHM_FOLDER_PREFIX="${SHM_FOLDER_PREFIX:-}"
+
+function perror() { 
+    cat <<< "${@:-}" 1>&2; 
+}
+
+function username () {
+    local user=$(whoami 2> /dev/null)
+    local ret="${?:99}"
+    if [ 'x0' != "x${ret}" ]; then
+        user=$(id -u > /dev/null)
+        ret="${?:99}"
+    fi
+    if [ 'x0' = "x${ret}" ]; then
+        echo "${user}"
+    else
+        echo 'Unknown user!'
+    fi
+}
+
+# start the runtime with the extra options
+if [ 'x' = "x${SHM_FOLDER_PREFIX}" ]; then
+    perror '$SHM_FOLDER_PREFIX not defined!'
+    exit 77
+fi
+
+if [ -w "/dev" ]; then
+    perror "WARNING: /dev is writeable currently for user '$(username)'. "'This is not compliant with real-world observations of a lambda context!'
+fi
+
+if case "${SHM_FOLDER_PREFIX}" in */) true;; *) false;; esac; then
+    # in case this is a folder, ensure it exists with the right permissions:
+    if [ ! -d "${SHM_FOLDER_PREFIX}" ]; then
+        if [ -f "${SHM_FOLDER_PREFIX}" ]; then
+            perror "${SHM_FOLDER_PREFIX}"'is currently a file! Removing...'
+            rm "${SHM_FOLDER_PREFIX}"
+        fi
+        perror 'Writing '"${SHM_FOLDER_PREFIX}"' for first-time shm initialization.'
+        mkdir -p "${SHM_FOLDER_PREFIX}"
+    fi
+    # ARJ: make it like /tmp with a sticky bit set:
+    chmod 1777 "${SHM_FOLDER_PREFIX}"
+    perror 'All shared memory files will open under the folder '"${SHM_FOLDER_PREFIX}"
+else
+    perror 'All shared memory files will open with a filename prefix '"${SHM_FOLDER_PREFIX}"
+fi
+if [ 'x' = "x${args}" ]; then
+    perror 'no arguments given to this bootstrap script, exiting!'
+    exit 1
+fi
+
+exec ${args}

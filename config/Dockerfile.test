@@ -1,0 +1,14 @@
+ARG source
+FROM $source AS builder
+
+# Define the user/group
+RUN (echo 'sbx_user1051:x:1000:1000:sbx_user1051:/tmp:/nonexistent' | tee -a /etc/passwd) && \
+    (echo 'sbx_user1051:x:1000:' | tee -a /etc/group)
+# RUN yum -y install strace
+# same user name as lambda:
+USER sbx_user1051
+
+# Add our test handler
+ADD test_handler.py lambda_handler.py
+
+CMD ["lambda_handler.handler"]
