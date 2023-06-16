@@ -93,6 +93,7 @@ class InvertedMapping(Generic[T, U], AbstractSet):
                         keys.append(key)
                 return tuple(self[key] for key in keys)
             if key.start:
+                print("BALH", key.start, self._mapping)
                 return self._getitem_func(key.start, all=True)
             if not any((key.start, key.stop, key.step)):
                 return type(self)(self._mapping.copy())

@@ -260,6 +260,7 @@ def download(context: Context, /, silent: bool = False) -> Tuple[Image, ...]:
         )
         tags = BASE_IMAGES_BY_SHA[image_sha:image_sha]
         for tag in tags:
+            print(f"Tagging {image_sha} -> {tag}")
             context.run(f"docker tag {image_sha} {tag}", hide="both" if silent else None)
         downloaded.append(Image(image_sha, tuple(tags)))
     return tuple(downloaded)
@@ -296,6 +297,8 @@ def image_name(
         if not all:
             return image
         results.append(image)
+    if not all and not results:
+        raise FileNotFoundError(f"Unable to find images for {base_image}")
     return tuple(results)
 
 
@@ -326,15 +329,19 @@ def build(
         if runtime:
             if not silent:
                 print("Building runtime image", file=sys.stderr)
-            context.run(
+            path = (
                 "docker compose --ansi never "
                 "-f config/docker-compose.yml "
                 "build "
                 f"--build-arg BASE_IMAGE={base_image} "
                 f"--build-arg TODAY={now} "
-                "runtime",
+                "runtime"
+            )
+            print(f"Running {path!r} {image_name!r}")
+            context.run(
+                path,
                 env=compose_environ(IMAGE_NAME=image_name),
-                hide="both" if silent else None,
+                hide=("both" if silent else None),
             )
             images.append(image_name)
         if tests:
@@ -348,7 +355,7 @@ def build(
                 f"--build-arg TODAY={now} "
                 "runtime",
                 env=compose_environ(IMAGE_NAME=image_name),
-                hide="both" if silent else None,
+                hide=("both" if silent else None),
             )
             images.append(f"{image_name}-test")
     return tuple(images)
