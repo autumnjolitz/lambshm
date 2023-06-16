@@ -1,25 +1,177 @@
 import inspect
 import json
 import sys
+import os
 import functools
 import types
 import dataclasses
+import shutil
 import pprint
 import typing
 import importlib
 import builtins
-from typing import Any, Literal, Iterable
-
+import importlib.util
+from pathlib import Path
+from typing import (
+    Any,
+    Literal,
+    Tuple,
+    Optional,
+    Dict,
+    TypeVar,
+    Iterable,
+    ValuesView,
+    KeysView,
+    Generic,
+    Mapping,
+    Union,
+    Type,
+)
+from tempfile import NamedTemporaryFile
 from invoke import task as _task
 from invoke.context import Context
+from collections import ChainMap
 from contextlib import suppress
-from typing import Tuple, Optional, Dict, TypeVar
-from collections.abc import Mapping as AbstractMapping, Iterable as AbstractIterable
+from collections.abc import MutableSet as AbstractSet
 
 try:
     from typing import get_overloads
 except ImportError:
     from typing_extensions import get_overloads
+
+T = TypeVar("T")
+U = TypeVar("U")
+DEBUG_CODEGEN = "DEBUG_CODEGEN" in os.environ and os.environ["DEBUG_CODEGEN"].lower().startswith(
+    ("1", "yes", "y", "on", "t")
+)
+
+
+class InvertedMapping(Generic[T, U], AbstractSet):
+    _mapping: Mapping[T, U]
+    _keys_view: Optional[KeysView]
+    __slots__ = (
+        "_mapping",
+        "_keys_view",
+        "_values_view",
+        "_iter_values_func",
+        "_contains_func",
+        "_getitem_func",
+    )
+
+    # Start by filling-out the abstract methods
+    def __init__(self, mapping, /, **kwargs):
+        self._mapping = mapping
+        self._iter_values_func = self._iter_via_iter
+        self._contains_func = self._mapping_contains
+        self._getitem_func = self._get_key_from_value_mapping
+
+        with suppress(AttributeError):
+            keys = mapping.keys()
+            if isinstance(keys, KeysView):
+                self._keys_view = keys
+                self._iter_values_func = self._iter_view_values_view
+        with suppress(AttributeError):
+            values = mapping.values()
+            if isinstance(values, ValuesView):
+                self._values_view = values
+                self._contains_func = self._view_contains
+                self._getitem_func = self._get_key_from_value_view
+
+    def __getitem__(self, key: Union[U, slice]) -> T:
+        if isinstance(key, slice):
+            if key.start and key.stop and key.start != key.stop:
+                emit = False
+                keys = []
+                for mapkey in self._mapping:
+                    if key.start == mapkey:
+                        emit = True
+                    if key.stop == mapkey:
+                        if not emit:
+                            return ()
+                        emit = False
+                    if emit:
+                        keys.append(key)
+                return tuple(self[key] for key in keys)
+            if key.start:
+                return self._getitem_func(key.start, all=True)
+            if not any((key.start, key.stop, key.step)):
+                return type(self)(self._mapping.copy())
+            raise ValueError
+        return self._getitem_func(key)
+
+    def add(self, value: U):
+        self._mapping[value] = value
+
+    def discard(self, value: U) -> None:
+        keys = self.getall(value)
+        for key in keys:
+            del self._mapping[key]
+
+    def getall(self, value: U) -> Tuple[T, ...]:
+        return self._get_key_from_value_mapping(value, all=True)
+
+    def get(self, value: U, default: Optional[T] = None) -> Optional[T]:
+        keys = self.getall(value)
+        with suppress(ValueError):
+            key, *_ = keys
+            return key
+        return default
+
+    def _get_key_from_value_mapping(self, value: U, all: bool = False) -> Union[T, Tuple[T, ...]]:
+        keys = []
+        for map_key, map_value in self._mapping.items():
+            if map_value == value:
+                keys.append(map_key)
+        if keys:
+            if all:
+                return tuple(keys)
+            return keys[0]
+        if all:
+            return ()
+        raise KeyError(value)
+
+    def _get_key_from_value(self, value: U, all: bool = False) -> T:
+        if value not in self._values_view:
+            raise KeyError(value)
+        return self._get_key_from_value_mapping(value, all=all)
+
+    def __len__(self):
+        return len(self._mapping)
+
+    def __iter__(self):
+        with suppress(AttributeError):
+            yield from self._iter_values_func()
+
+    def __contains__(self, value):
+        with suppress(AttributeError):
+            return self._contains_func(value)
+        return False
+
+    def _iter_view_values_view(self):
+        yield from self._values_view
+
+    def _iter_via_iter(self) -> Iterable[T]:
+        for key in self._mapping:
+            yield self._mapping[key]
+
+    # Modify __contains__ and get() to work like dict
+    # does when __missing__ is present.
+    def _view_contains(self, value: Any) -> bool:
+        return value in self._values_view
+
+    def _mapping_contains(self, value: U) -> bool:
+        for member in self:
+            if member == value:
+                return True
+        return False
+
+    def __str__(self):
+        keys = repr(tuple(self))[1:-1]
+        return "{%s}" % keys
+
+    # Now, add the methods in dicts but not in MutableMapping
+    def __repr__(self):
+        return f"{type(self).__name__}({self._mapping!r})"
 
 
 def is_context_param(
@@ -80,7 +232,7 @@ def is_type_container(item):
     return True
 
 
-def this() -> types.ModuleType:
+def find_this() -> types.ModuleType:
     try:
         return sys.modules["tasks"]
     except KeyError:
@@ -94,12 +246,12 @@ def get_types_from(
     in_namespace: Optional[Dict[str, Any]] = None,
 ) -> Iterable[FoundType]:
     if in_namespace is None:
-        in_namespace = vars(this())
+        in_namespace = vars(find_this())
     if annotation is inspect.Signature.empty:
         annotation = Any
     if isinstance(annotation, str):
         ns = {}
-        exec(f"annotation = {annotation!s}", vars(this()), ns)
+        exec(f"annotation = {annotation!s}", vars(find_this()), ns)
         annotation = ns["annotation"]
 
     if is_literal(annotation):
@@ -159,7 +311,7 @@ def get_types_from(
             target = getattr(target, step)
         except AttributeError as e:
             try:
-                target = getattr(this(), path[0])
+                target = getattr(find_this(), path[0])
             except AttributeError:
                 try:
                     # print('trying', path, type_name)
@@ -268,87 +420,25 @@ def first(iterable: Iterable[T]) -> T:
         return item
 
 
-def task(func):
-    # print("Called from", inspect.stack()[1].frame.f_globals["__name__"])
-    globalns = inspect.stack()[1].frame.f_globals
-    localns = inspect.stack()[1].frame.f_locals or {}
-    blank = ""
-    this = sys.modules[globalns["__name__"]]
-    # print('this', this, 'for', this.__name__)
-    globalns.update(
-        {
-            "NoneType": type(None),
-            "this": this,
-            "typing": typing,
-            "Optional": Optional,
-            "pprint": pprint,
-            "json": json,
-            "Union": typing.Union,
-            "Any": Any,
-            "sys": sys,
-            "AbstractMapping": AbstractMapping,
-            "AbstractIterable": AbstractIterable,
-        }
-    )
-    ns = {**localns}
-    sig = sanitize_return(func, ns)
-    inner_function_call = sig
-    is_contextable = False
+def indentation_length(s: str) -> int:
+    length = 0
+    if "\n" in s:
+        for line in s.splitlines(True)[1:]:
+            for char in line:
+                if char == " ":
+                    length += 1
+                    continue
+                break
+            return length
+    for char in s:
+        if char == " ":
+            length += 1
+            continue
+        break
+    return length
 
-    if sig.parameters:
-        for param in sig.parameters:
-            if is_context_param(sig.parameters[param]):
-                is_contextable = True
-            break
-    if not is_contextable:
-        for index, param in enumerate(sig.parameters):
-            param = sig.parameters[param]
-            if not index:
-                continue
-            if is_context_param(param) in ("type", "name_and_type"):
-                # okay, the context is definitely out of order
-                raise NotImplementedError(
-                    "TODO: Implement generating an inner_function_call with rearranged values"
-                )
-    prefix_params = []
-    if not is_contextable:
-        prefix_params = [
-            inspect.Parameter("context", inspect.Parameter.POSITIONAL_ONLY, annotation=Context)
-        ]
 
-    additional_params = []
-    if "silent" not in inner_function_call.parameters:
-        silent = inspect.Parameter(
-            "silent", inspect.Parameter.KEYWORD_ONLY, annotation=bool, default=False
-        )
-        additional_params.append(silent)
-    format_key = "format"
-    if format_key in inner_function_call.parameters:
-        format_key = "format_"
-    format_ = inspect.Parameter(
-        format_key,
-        inspect.Parameter.KEYWORD_ONLY,
-        annotation=Optional[Literal["json", "python", "lines"]],
-        default=None,
-    )
-    if format_key not in inner_function_call.parameters:
-        additional_params.append(format_)
-
-    new_signature = reify_annotations_in(
-        localns,
-        sig.replace(
-            parameters=(
-                *prefix_params,
-                *sig.parameters.values(),
-                *additional_params,
-            )
-        ),
-    )
-
-    def wrap_func(func):
-        ns = {**localns}
-        signature = inspect.signature(func)
-        code = """
+INTERNAL_WRAPPER = """
 def %(name)s%(args)s:
     _priv_format = %(format_kwarg)s
     if _priv_format not in (None, 'json', 'python', 'lines'):
@@ -374,12 +464,12 @@ def %(name)s%(args)s:
         print(pprint.pformat(result))
         return result
     if _priv_format == 'lines':
-        if isinstance(result, AbstractMapping):
+        if isinstance(result, Mapping):
             for key in result:
                 value = result[key]
                 print(f"{key}:\t{value}")
             return result
-        elif isinstance(result, AbstractIterable) and not isinstance(result, (str, bytes)):
+        elif isinstance(result, Iterable) and not isinstance(result, (str, bytes)):
             for item in result:
                 print(item)
             return result
@@ -388,18 +478,9 @@ def %(name)s%(args)s:
         return result
     return result
 
-        """ % dict(
-            name=func.__name__,
-            args=str(new_signature),
-            sig_funccall=raw_param_body_from(signature),
-            format_kwarg=format_key,
-        )
-        exec(code, globalns, ns)
-        new_func = ns[func.__name__]
-        setattr(this._, f"_original_{func.__name__}", func)
-        return new_func
+        """
 
-    code = """
+PUBLIC_WRAPPER_FOR_INVOKE = """
 def %(name)s%(args)s:
     _priv_format = %(format_kwarg)s
     if _priv_format not in (None, 'json', 'python', 'lines'):
@@ -425,12 +506,12 @@ def %(name)s%(args)s:
         print(pprint.pformat(result))
         return result
     if _priv_format == 'lines':
-        if isinstance(result, AbstractMapping):
+        if isinstance(result, Mapping):
             for key in result:
                 value = result[key]
                 print(f"{key}:\t{value}")
             return result
-        elif isinstance(result, AbstractIterable) and not isinstance(result, (str, bytes)):
+        elif isinstance(result, Iterable) and not isinstance(result, (str, bytes)):
             for item in result:
                 print(item)
             return result
@@ -439,15 +520,181 @@ def %(name)s%(args)s:
         return result
     return result
 
-""" % dict(
-        name=func.__name__,
-        args=str(new_signature),
-        sig_funccall=raw_param_body_from(inner_function_call),
-        format_kwarg=format_key,
-    )
-    # print(code)
-    exec(code, globalns, ns)
-    setattr(this._, func.__name__, wrap_func(func))
-    wrapped_func = ns[func.__name__]
-    wrapped_func.__doc__ = f"{func.__doc__ or blank}\n:returns: {safe_annotation_string_from(new_signature.return_annotation)}"
-    return _task(wrapped_func)
+"""
+
+
+def task(callable_=None, /, **kwargs):
+    def wrapper(func):
+        # print("Called from", inspect.stack()[1].frame.f_globals["__name__"])
+        # Make a read only copy
+        stack = inspect.stack()[1:]
+        task_frame = stack[0].frame
+        while stack and task_frame.f_globals["__name__"] == __name__:
+            del stack[0]
+            task_frame = stack[0].frame
+        assert task_frame.f_globals["__name__"] != __name__
+        assert task_frame.f_globals["__name__"] == "tasks"
+        support_module_name = Path(task_frame.f_globals["__file__"]).stem
+        filename = f"_support_cache/{support_module_name}_{func.__name__}.py"
+        with suppress(FileNotFoundError):
+            os.remove(filename)
+        if DEBUG_CODEGEN:
+            os.makedirs("_support_cache", exist_ok=True)
+        elif os.path.exists("_support_cache"):
+            shutil.rmtree("_support_cache")
+        this = sys.modules[task_frame.f_globals["__name__"]]
+        if "this" not in task_frame.f_globals:
+            task_frame.f_globals = this
+        globalns = {
+            "_origin_globals_ref": task_frame.f_globals,
+            "__name__": task_frame.f_globals["__name__"],
+            # '__file__': task_frame.f_globals["__file__"],
+            "__builtins__": builtins,
+            "__file__": filename,
+            "ModuleType": types.ModuleType,
+        }
+        # populate global ns with a chain map:
+        truly_local_modifications = {}
+        localns = ChainMap(truly_local_modifications, task_frame.f_locals, task_frame.f_globals)
+        module = importlib.util.module_from_spec(
+            importlib.util.spec_from_file_location(f"tasksupport.support.{func.__name__}", filename)
+        )
+        localns.maps.append(globalns)
+        code = """
+this: Optional[ModuleType] = None
+
+def __getattr__(name: str):
+    '''
+    Look up in original global ns. Effective ChainMap of namespaces.
+    '''
+    print('a')
+    return _origin_globals_ref[name]
+
+"""
+        if DEBUG_CODEGEN:
+            with open(filename, "a+") as fh:
+                fh.write(code)
+                fh.seek(0)
+                code = fh.read()
+        exec(compile(code, filename, "exec"), globalns, localns)
+        globalns.update(truly_local_modifications)
+        truly_local_modifications.clear()
+        blank = ""
+        sig = sanitize_return(func, module.__dict__)
+        inner_function_call = sig
+        is_contextable = False
+
+        if sig.parameters:
+            for param in sig.parameters:
+                if is_context_param(sig.parameters[param]):
+                    is_contextable = True
+                break
+        if not is_contextable:
+            for index, param in enumerate(sig.parameters):
+                param = sig.parameters[param]
+                if not index:
+                    continue
+                if is_context_param(param) in ("type", "name_and_type"):
+                    # okay, the context is definitely out of order
+                    raise NotImplementedError(
+                        "TODO: Implement generating an inner_function_call with rearranged values"
+                    )
+        prefix_params = []
+        if not is_contextable:
+            prefix_params = [
+                inspect.Parameter("context", inspect.Parameter.POSITIONAL_ONLY, annotation=Context)
+            ]
+
+        additional_params = []
+        if "silent" not in inner_function_call.parameters:
+            silent = inspect.Parameter(
+                "silent", inspect.Parameter.KEYWORD_ONLY, annotation=bool, default=False
+            )
+            additional_params.append(silent)
+        format_key = "format"
+        if format_key in inner_function_call.parameters:
+            format_key = "format_"
+        format_ = inspect.Parameter(
+            format_key,
+            inspect.Parameter.KEYWORD_ONLY,
+            annotation=Optional[Literal["json", "python", "lines"]],
+            default=None,
+        )
+        if format_key not in inner_function_call.parameters:
+            additional_params.append(format_)
+            kwargs.setdefault("help", {})
+            kwargs["help"][
+                format_key
+            ] = f'may be one of "json", "python", "lines" (defaults to lines).'
+
+        # Load into the local namespace any missing annotations necessary to run with when
+        # we recreate the argument signature:
+        new_signature = reify_annotations_in(
+            localns,
+            sig.replace(
+                parameters=(
+                    *prefix_params,
+                    *sig.parameters.values(),
+                    *additional_params,
+                )
+            ),
+        )
+        if "silent" in new_signature.parameters:
+            kwargs.setdefault("help", {})
+            kwargs["help"]["silent"] = "Set to reduce console output (defaults to false)"
+
+        # Merge into the proxy module any missing deps
+        module.__dict__.update(truly_local_modifications)
+        # Merge in the new globals
+        module.__dict__.update(globalns)
+
+        def wrap_func(func):
+            ns = ChainMap({}, localns, vars(module))
+            signature = inspect.signature(func)
+            code = INTERNAL_WRAPPER % dict(
+                name=func.__name__,
+                args=str(new_signature),
+                sig_funccall=raw_param_body_from(signature),
+                format_kwarg=format_key,
+            )
+            if DEBUG_CODEGEN:
+                with open(filename, "a+") as fh:
+                    fh.write(code)
+                    fh.seek(0)
+                    code = fh.read()
+
+            exec(compile(code, filename, "exec"), task_frame.f_globals, ns)
+            new_func = ns.maps[0][func.__name__]
+            setattr(this._, f"_original_{func.__name__}", func)
+            return new_func
+
+        code = PUBLIC_WRAPPER_FOR_INVOKE % dict(
+            name=func.__name__,
+            args=str(new_signature),
+            sig_funccall=raw_param_body_from(inner_function_call),
+            format_kwarg=format_key,
+        )
+        # print(code)
+        if DEBUG_CODEGEN:
+            with open(filename, "a+") as fh:
+                fh.write(code)
+                fh.seek(0)
+                code = fh.read()
+        exec(compile(code, filename, "exec"), task_frame.f_globals, localns)
+        setattr(this._, func.__name__, wrap_func(func))
+        public_func = localns[func.__name__]
+        indent = " " * indentation_length(func.__doc__ or blank)
+        if ":returns:" not in (func.__doc__ or blank):
+            func.__doc__ = f"{func.__doc__ or blank}\n{indent}:returns: {safe_annotation_string_from(new_signature.return_annotation)}"
+        public_func.__doc__ = func.__doc__
+        if kwargs:
+            return _task(**kwargs)(public_func)
+        return _task(public_func)
+
+    if callable_ is not None:
+        with suppress(AttributeError):
+            name = callable_.__name__
+            wrapper.__name__ = f"wrapper_for_{name}"
+        return wrapper(callable_)
+    wrapper.__name__ = f"wrapper_for_unnamed_caller"
+    return wrapper
