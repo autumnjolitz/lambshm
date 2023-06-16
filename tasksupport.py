@@ -534,6 +534,8 @@ def task(callable_=None, /, **kwargs):
             task_frame = stack[0].frame
         assert task_frame.f_globals["__name__"] != __name__
         assert task_frame.f_globals["__name__"] == "tasks"
+        if "Mapping":
+            task_frame.f_globals["Mapping"] = Mapping
         support_module_name = Path(task_frame.f_globals["__file__"]).stem
         filename = f"_support_cache/{support_module_name}_{func.__name__}.py"
         with suppress(FileNotFoundError):
