@@ -2,27 +2,30 @@ import json
 import os
 import shutil
 import types
-import pprint
 import datetime
 import builtins
 import sys
-from invoke.exceptions import UnexpectedExit
-from typing import Literal, Type, Union, Iterable, Dict, Tuple, NamedTuple
-
-from pathlib import Path
-from invoke.context import Context
+import shlex
+from collections import defaultdict
 from contextlib import suppress
+from invoke.exceptions import UnexpectedExit
+from pathlib import Path
+from typing import Literal, Type, Union, Iterable, Dict, Tuple, NamedTuple, Optional, List
 
-from tasksupport import task, first
+from invoke.context import Context
+from tasksupport import task, first, InvertedMapping
 
 _ = types.SimpleNamespace()
 this = sys.modules[__name__]
 AWS_LAMBDA_REPO = "public.ecr.aws/lambda/python"
-BASE_IMAGES = {
-    # python:3.8
-    AWS_LAMBDA_REPO: f"{AWS_LAMBDA_REPO}@sha256:a04abc05330a09c239c3e3d62408dd8331c5b3e3ee323a3d8a29cb0fad4d5356",
-}
-
+BASE_IMAGES = defaultdict(
+    lambda key: key,
+    {
+        # python:3.8
+        AWS_LAMBDA_REPO: f"{AWS_LAMBDA_REPO}@sha256:a04abc05330a09c239c3e3d62408dd8331c5b3e3ee323a3d8a29cb0fad4d5356",
+    },
+)
+BASE_IMAGES_BY_SHA = InvertedMapping(BASE_IMAGES)
 
 _EMPTY_MAPPING = {}
 
@@ -31,6 +34,11 @@ class HashedImage(NamedTuple):
     repository: str
     type: str
     hash: str
+
+
+class Image(NamedTuple):
+    name: str
+    tags: Tuple[str, ...]
 
 
 def compose_environ(*, copy_os_environ: bool = False, **kwargs) -> Dict[str, str]:
@@ -229,7 +237,7 @@ def all_source_image_names(context, silent: bool = False) -> Tuple[str, ...]:
     List the source image friendly names
     """
     all_images = []
-    for base_image in BASE_IMAGES.values():
+    for base_image in BASE_IMAGES_BY_SHA:
         with suppress(ValueError):
             image, hash_function, value = _.split_image_hash(context, base_image)
             if not silent:
@@ -244,22 +252,51 @@ def all_source_image_names(context, silent: bool = False) -> Tuple[str, ...]:
 
 
 @task
-def download(context: Context):
-    for key, value in BASE_IMAGES.items():
-        context.run(f"docker pull {value}", env=compose_environ())
-        context.run(f"docker tag {value} {key}")
+def download(context: Context, /, silent: bool = False) -> Tuple[Image, ...]:
+    downloaded: List[Image] = []
+    for image_sha in BASE_IMAGES_BY_SHA:
+        context.run(
+            f"docker pull {image_sha}", env=compose_environ(), hide="both" if silent else None
+        )
+        tags = BASE_IMAGES_BY_SHA[image_sha:image_sha]
+        for tag in tags:
+            context.run(f"docker tag {image_sha} {tag}", hide="both" if silent else None)
+        downloaded.append(Image(image_sha, tuple(tags)))
+    return tuple(downloaded)
 
 
-@task
-def image_name(context: Context, base_image: str) -> str:
+@task()
+def image_name(
+    context: Context,
+    /,
+    base_image: Optional[str] = None,
+    skip_tag: List[str] = ["latest", "head", "main", "master"],
+    all: bool = False,
+) -> str:
     """
     Given a base image, return the expected patched output name
     """
-    (base_image, *_) = this._.get_tags_from(context, base_image, silent=True)
-    _, image = base_image.rsplit("/", 1)
-    image = image.translate({ord(":"): None})
-    image = f"lambshm/{image}"
-    return image
+    if base_image is None:
+        base_image = first(BASE_IMAGES_BY_SHA)
+    image_tags = this._.get_tags_from(context, base_image, silent=True)
+    results = []
+    skip_tag = frozenset(skip_tag)
+    for base_image in image_tags:
+        _, image = base_image.rsplit("/", 1)
+        tag_name = ""
+        with suppress(ValueError):
+            image, tag_name = image.split(":")
+            if tag_name in skip_tag:
+                continue
+        if tag_name:
+            if tag_name[0].isdigit():
+                image = f"lambshm/{image}{tag_name}"
+            else:
+                image = f"lambshm/{image}-{tag_name}"
+        if not all:
+            return image
+        results.append(image)
+    return tuple(results)
 
 
 @task
@@ -270,7 +307,7 @@ def all_image_names(
     List all the expected image names given the BASE_IMAGES
     """
     images = []
-    for base_image in BASE_IMAGES.values():
+    for base_image in BASE_IMAGES_BY_SHA:
         images.append(image_name(context, base_image, silent=True))
     return tuple(images)
 
@@ -284,7 +321,7 @@ def build(
     """
     now = datetime.datetime.utcnow().astimezone(datetime.timezone.utc).isoformat(timespec="seconds")
     images = []
-    for base_image in BASE_IMAGES.values():
+    for base_image in BASE_IMAGES_BY_SHA:
         image_name = _.image_name(context, base_image, silent=True)
         if runtime:
             if not silent:
@@ -324,7 +361,7 @@ def test(context: Context, as_server: bool = False, silent: bool = False) -> boo
 
     returns if it passes the test
     """
-    image_name = _.image_name(context, first(BASE_IMAGES.values()), silent=True)
+    image_name = _.image_name(context, first(BASE_IMAGES_BY_SHA), silent=True)
     env = compose_environ(IMAGE_NAME=image_name)
     if as_server:
         result = context.run(
@@ -351,14 +388,36 @@ def test(context: Context, as_server: bool = False, silent: bool = False) -> boo
 
 
 @task
-def list_local_images(context: Context) -> Tuple[str, ...]:
+def list_local_images(
+    context: Context, /, show: Literal["test", "runtime", "both"] = "both"
+) -> Tuple[str, ...]:
+    if show not in ("test", "runtime", "both"):
+        raise SystemExit(f'Invalid show mode {show!r} - try one of {{"test", "both", "runtime"}} ')
+    images = []
     result = context.run("docker image ls --format '{{ .Repository}}' lambshm/*", hide="both")
-    image_ids = [x.strip() for x in result.stdout.splitlines() if x.strip()]
-    return tuple(image_ids)
+    for image in (x.strip() for x in result.stdout.splitlines() if x.strip()):
+        if image.endswith("-test"):
+            if show in ("both", "test"):
+                images.append(image)
+            continue
+        if show in ("both", "runtime"):
+            images.append(image)
+    return tuple(images)
 
 
 @task
-def list_containers_using(context: Context, image_id: str, silent: bool = False) -> Tuple[str, ...]:
+def upload(context: Context, /, repo_prefix: str, build_ref: str) -> None:
+    images = list_local_images(context, "runtime")
+    if images:
+        upload_script = project_root(Path, silent=True) / "scripts" / "upload-to-github.sh"
+        images = " ".join(shlex.quote(image) for image in images)
+        context.run(f"{upload_script!s} '{repo_prefix}' '{build_ref}' {images}")
+
+
+@task
+def list_containers_using(
+    context: Context, /, image_id: str, silent: bool = False
+) -> Tuple[str, ...]:
     format = '--format "{{.ID}}"'
     result = context.run(
         f"docker container ls --all --filter=ancestor='{image_id}' {format}", hide="both"
