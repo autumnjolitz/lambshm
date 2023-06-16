@@ -1,5 +1,5 @@
-ARG source
-FROM $source AS builder
+ARG BASE_IMAGE
+FROM $BASE_IMAGE AS builder
 
 # Define the user/group
 RUN (echo 'sbx_user1051:x:1000:1000:sbx_user1051:/tmp:/nonexistent' | tee -a /etc/passwd) && \
@@ -11,4 +11,5 @@ USER sbx_user1051
 # Add our test handler
 ADD test_handler.py lambda_handler.py
 
+# test via curl -XPOST "http://localhost:9000/2015-03-31/functions/function/invocations" -d '{"limit": 21}'
 CMD ["lambda_handler.handler"]

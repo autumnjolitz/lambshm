@@ -14,12 +14,14 @@ jobs:
 
     steps:
     - uses: actions/checkout@v3
-    - name: Build the Docker image
-      run: docker compose --ansi never -f config/docker-compose.yml build --progress plain lambda_py38
-    - name: Build the test image
-      run: docker compose --ansi never -f config/docker-compose.yml -f config/docker-compose.test.yml build --progress plain
-    - name: Test the image
-      run: docker compose --ansi never  -f config/docker-compose.yml -f config/docker-compose.test.yml run --entrypoint /bin/sh --rm lambda_py38 -c 'mkdir /tmp/shm && python /var/task/lambda_handler.py'
+    - name: Install venv
+      run: python -m pip install -r dev-requirements.txt
+    - name: Download
+      run: python -m invoke download
+    - name: Build
+      run: python -m invoke build
+    - name: Test
+      run: python -m invoke test
     - name: Log in to registry
       run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u $ --password-stdin
     - name: Push image

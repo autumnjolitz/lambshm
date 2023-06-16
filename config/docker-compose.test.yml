@@ -1,6 +1,6 @@
 services:
-  lambda_py38:
-    image: "lambshm/python3.8-test"
+  runtime:
+    image: "${IMAGE_NAME}-test"
     ipc: none
     read_only: true
     tmpfs:
@@ -11,5 +11,3 @@ services:
     build:
       context: '..'
       dockerfile: 'config/Dockerfile.test'
-      args:
-        source: "lambshm/python3.8"
