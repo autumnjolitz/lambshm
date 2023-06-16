@@ -8,13 +8,21 @@ if [ 'x' = "x$OWNER" ]; then
   echo 'no owner!'
   exit 1
 fi
+shift
+
 REFERENCE="${2:-}"
 if [ 'x' = "x$REFERENCE" ]; then
   echo 'no REFERENCE!'
   exit 1
 fi
+shift
+IMAGES="${@:-}"
+if [ 'x' = "x$IMAGES" ]; then
+  echo 'no images to upload'
+  exit 1
+fi
 
-for IMAGE_NAME in $(docker image ls --format '{{ .Repository}}' lambshm/*)
+for IMAGE_NAME in $IMAGES
 do
     if ! case "${IMAGE_NAME}" in *-test) true;; *) false;; esac; then
       IMAGE_ID="ghcr.io/${OWNER}/$IMAGE_NAME"

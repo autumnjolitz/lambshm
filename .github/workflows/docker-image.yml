@@ -17,13 +17,13 @@ jobs:
     - name: Install venv
       run: python -m pip install -r dev-requirements.txt
     - name: Download
-      run: python -m invoke download
+      run: invoke download
     - name: Build
-      run: python -m invoke build
+      run: invoke build
     - name: Test
-      run: python -m invoke test
+      run: invoke test
     - name: Log in to registry
       run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u $ --password-stdin
     - name: Push image
-      run: ./scripts/upload-to-github.sh "${{ github.repository_owner }}" "${{ github.ref }}"
+      run: invoke upload --repo-prefix='${{ github.repository_owner }}' --build-ref='${{ github.ref }}'
 
