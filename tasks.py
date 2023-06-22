@@ -363,7 +363,7 @@ def cached_digest_for(
 
 
 @task()
-def image_name(
+def our_image_name_for(
     context: Context,
     /,
     base_image: Optional[str] = None,
@@ -421,7 +421,7 @@ def build(
     now = datetime.datetime.utcnow().astimezone(datetime.timezone.utc).isoformat(timespec="seconds")
     images = []
     for base_image in BASE_IMAGES_BY_SHA:
-        image_name = _.image_name(context, base_image, silent=True)
+        image_name = _.our_image_name_for(context, base_image, silent=True)
         if runtime:
             if not silent:
                 print("Building runtime image", file=sys.stderr)
@@ -465,30 +465,31 @@ def test(context: Context, as_server: bool = False, silent: bool = False) -> boo
 
     returns if it passes the test
     """
-    image_name = _.image_name(context, first(BASE_IMAGES_BY_SHA), silent=True)
-    env = compose_environ(IMAGE_NAME=image_name)
-    if as_server:
-        result = context.run(
-            "docker compose --ansi never "
-            "-f config/docker-compose.yml -f config/docker-compose.test.yml "
-            "run --rm "
-            "runtime ",
-            env=env,
-            hide="both" if silent else None,
-        )
-    else:
-        result = context.run(
-            "docker compose --ansi never "
-            "-f config/docker-compose.yml -f config/docker-compose.test.yml "
-            "run --rm --entrypoint /bin/sh "
-            "runtime "
-            "-c 'mkdir /tmp/shm && python lambda_handler.py'",
-            env=env,
-            hide="both" if silent else None,
-        )
-    if result:
-        return True
-    return False
+    for image_sha in BASE_IMAGES_BY_SHA:
+        image_name = _.our_image_name_for(context, image_sha, silent=True)
+        env = compose_environ(IMAGE_NAME=image_name)
+        if as_server:
+            result = context.run(
+                "docker compose --ansi never "
+                "-f config/docker-compose.yml -f config/docker-compose.test.yml "
+                "run --rm "
+                "runtime ",
+                env=env,
+                hide="both" if silent else None,
+            )
+        else:
+            result = context.run(
+                "docker compose --ansi never "
+                "-f config/docker-compose.yml -f config/docker-compose.test.yml "
+                "run --rm --entrypoint /bin/sh "
+                "runtime "
+                "-c 'mkdir /tmp/shm && python lambda_handler.py'",
+                env=env,
+                hide="both" if silent else None,
+            )
+        if not result:
+            return False
+    return True
 
 
 @task
