@@ -2,11 +2,12 @@ import json
 import os
 import shutil
 import types
+import base64
 import datetime
 import builtins
 import sys
+import time
 import shlex
-from collections import defaultdict
 from contextlib import suppress
 from invoke.exceptions import UnexpectedExit
 from pathlib import Path
@@ -18,18 +19,45 @@ from tasksupport import task, first, InvertedMapping, trim
 _ = types.SimpleNamespace()
 this = sys.modules[__name__]
 AWS_LAMBDA_REPO = "public.ecr.aws/lambda/python"
-BASE_IMAGES = defaultdict(
-    lambda key: key,
-    {
-        # python:3.8
-        f"{AWS_LAMBDA_REPO}:3.8": f"{AWS_LAMBDA_REPO}@sha256:a04abc05330a09c239c3e3d62408dd8331c5b3e3ee323a3d8a29cb0fad4d5356",
-        # python:3.9
-        # f"{AWS_LAMBDA_REPO}:3.9": f"{AWS_LAMBDA_REPO}@sha256:24c5f5135c69f00ff9e43c320b7602177f390ed6637ac00f07272e812a286dc4",
-    },
-)
+BASE_IMAGES: dict[str, str | None] = {
+    # python:3.8
+    f"{AWS_LAMBDA_REPO}:3.8": f"{AWS_LAMBDA_REPO}@sha256:a04abc05330a09c239c3e3d62408dd8331c5b3e3ee323a3d8a29cb0fad4d5356",
+    # python:3.9
+    # f"{AWS_LAMBDA_REPO}:3.9": f"{AWS_LAMBDA_REPO}@sha256:24c5f5135c69f00ff9e43c320b7602177f390ed6637ac00f07272e812a286dc4",
+}
 BASE_IMAGES_BY_SHA = InvertedMapping(BASE_IMAGES)
+IMAGE_DIGEST_CACHE_TTL: int | float = 5 * 60
+EMPTY_MAPPING = {}
+DEFAULT_FORMAT = "lines"
 
-_EMPTY_MAPPING = {}
+
+def _task_init():
+    del globals()["_task_init"]
+    root = _.project_root(Path, silent=True)
+    for image_tag in BASE_IMAGES:
+        override_filename = root / f".overrides.{_.b64encode(image_tag)}"
+        if not override_filename.exists():
+            continue
+        if BASE_IMAGES[image_tag] is not None:
+            with suppress(FileNotFoundError):
+                os.remove(override_filename)
+            continue
+        with suppress(FileNotFoundError):
+            with open(override_filename, "r") as fh:
+                image_sha, ts = fh.read().strip().splitlines()
+                ts = float(ts)
+                ttl = ts - time.time()
+                if ttl > 0:
+                    print(
+                        f"Loaded cached SHA ({image_sha!r}) for {image_tag!r} (TTL {ttl:.2f}). Please add a SHA to the BASE_IMAGES!",
+                        file=sys.stderr,
+                    )
+                    BASE_IMAGES[image_tag] = image_sha
+                    continue
+                print(
+                    f"Ignoring cached {image_sha!r} -- expired {ttl} seconds ago", file=sys.stderr
+                )
+                os.remove(override_filename)
 
 
 class HashedImage(NamedTuple):
@@ -48,7 +76,7 @@ def compose_environ(*, copy_os_environ: bool = False, **kwargs) -> Dict[str, str
     Returns some common values for Docker builds
     """
     environment = {
-        **(os.environ if copy_os_environ else _EMPTY_MAPPING),
+        **(os.environ if copy_os_environ else EMPTY_MAPPING),
         "NO_COLOR": "1",
         "COMPOSE_DOCKER_CLI_BUILD": "1",
         "BUILDX_EXPERIMENTAL": "1",
@@ -58,6 +86,19 @@ def compose_environ(*, copy_os_environ: bool = False, **kwargs) -> Dict[str, str
         **kwargs,
     }
     return environment
+
+
+@task
+def b64encode(value: str, silent: bool = True) -> str:
+    return base64.urlsafe_b64encode(value.encode()).decode().strip()
+
+
+@task
+def b64decode(value: str, silent: bool = True) -> str:
+    remainder = len(value) % 8
+    if remainder:
+        value += "=" * remainder
+    return base64.urlsafe_b64decode(value).decode().strip()
 
 
 @task
@@ -254,7 +295,7 @@ def all_source_image_names(context, silent: bool = False) -> Tuple[str, ...]:
 
 
 @task
-def get_shas_for(context: Context, image_name: str, *, silent: bool = False) -> tuple[str, ...]:
+def digests_for(context: Context, image_name: str, *, silent: bool = False) -> tuple[str, ...]:
     image_name_prefix = image_name
     if ":" in image_name_prefix:
         image_name_prefix, _ = image_name_prefix.split(":", 1)
@@ -271,7 +312,6 @@ def get_shas_for(context: Context, image_name: str, *, silent: bool = False) -> 
 @task
 def download(context: Context, /, silent: bool = False) -> Tuple[Image, ...]:
     downloaded: List[Image] = []
-    seen: Set[str] = None
     for image_sha in BASE_IMAGES_BY_SHA:
         if image_sha is None:
             continue
@@ -280,8 +320,8 @@ def download(context: Context, /, silent: bool = False) -> Tuple[Image, ...]:
         )
         tags = BASE_IMAGES_BY_SHA[image_sha:image_sha]
         for tag in tags:
-            print(f"Tagging {image_sha} -> {tag}")
-            seen.add(tag)
+            if not silent:
+                print(f"Tagging {image_sha} -> {tag}")
             context.run(f"docker tag {image_sha} {tag}", hide="both" if silent else None)
         downloaded.append(Image(image_sha, tuple(tags)))
     for image_tag in BASE_IMAGES:
@@ -289,12 +329,37 @@ def download(context: Context, /, silent: bool = False) -> Tuple[Image, ...]:
             context.run(
                 f"docker pull {image_tag}", env=compose_environ(), hide="both" if silent else None
             )
-            fh = context.run(
-                f"docker images --no-trunc --quiet {image_tag}", hide="both" if silent else None
-            )
-            fh.stdout
-
+            image_sha = _.cached_digest_for(context, image_tag, silent=True)
+            if not silent:
+                print(f"Assigning {image_sha} to {image_tag} for this run", file=sys.stderr)
+            BASE_IMAGES[image_tag] = image_sha
     return tuple(downloaded)
+
+
+@task
+def cached_digest_for(
+    context: Context,
+    image_tag: str,
+    expires_in: float | int = IMAGE_DIGEST_CACHE_TTL,
+    silent: bool = False,
+) -> str:
+    root = _.project_root(Path, silent=True)
+    file = root / f".overrides.{_.b64encode(image_tag)}"
+    with suppress(FileNotFoundError):
+        with open(file) as fh:
+            image_sha, t_s = fh.read().strip().splitlines()
+            t_s = float(t_s)
+            ttl = t_s - time.time()
+            if ttl < expires_in:
+                return image_sha
+            # expired!
+            if not silent:
+                print(f"Removing {file!r}, renewing digests!", file=sys.stderr)
+            os.remove(file)
+    (image_sha,) = _.digests_for(context, image_tag, silent=True)
+    with open(file, "w") as fh:
+        fh.write(f"{image_sha}\n{time.time() + expires_in!s}\n")
+    return image_sha
 
 
 @task()
@@ -368,7 +433,8 @@ def build(
                 f"--build-arg TODAY={now} "
                 "runtime"
             )
-            print(f"Running {path!r} {image_name!r}")
+            if not silent:
+                print(f"Running {path!r} {image_name!r}", file=sys.stderr)
             context.run(
                 path,
                 env=compose_environ(IMAGE_NAME=image_name),
@@ -480,3 +546,6 @@ def clean(context: Context, silent: bool = False) -> None:
         image_ids = " ".join(image_ids)
         context.run(f"docker rmi -f {image_ids}", hide="both")
     context.run("docker builder prune -f", hide="both")
+
+
+_task_init()
