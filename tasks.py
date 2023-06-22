@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Literal, Type, Union, Iterable, Dict, Tuple, NamedTuple, Optional, List
 
 from invoke.context import Context
-from tasksupport import task, first, InvertedMapping
+from tasksupport import task, first, InvertedMapping, trim
 
 _ = types.SimpleNamespace()
 this = sys.modules[__name__]
@@ -22,7 +22,9 @@ BASE_IMAGES = defaultdict(
     lambda key: key,
     {
         # python:3.8
-        AWS_LAMBDA_REPO: f"{AWS_LAMBDA_REPO}@sha256:a04abc05330a09c239c3e3d62408dd8331c5b3e3ee323a3d8a29cb0fad4d5356",
+        f"{AWS_LAMBDA_REPO}:3.8": f"{AWS_LAMBDA_REPO}@sha256:a04abc05330a09c239c3e3d62408dd8331c5b3e3ee323a3d8a29cb0fad4d5356",
+        # python:3.9
+        # f"{AWS_LAMBDA_REPO}:3.9": f"{AWS_LAMBDA_REPO}@sha256:24c5f5135c69f00ff9e43c320b7602177f390ed6637ac00f07272e812a286dc4",
     },
 )
 BASE_IMAGES_BY_SHA = InvertedMapping(BASE_IMAGES)
@@ -252,17 +254,46 @@ def all_source_image_names(context, silent: bool = False) -> Tuple[str, ...]:
 
 
 @task
+def get_shas_for(context: Context, image_name: str, *, silent: bool = False) -> tuple[str, ...]:
+    image_name_prefix = image_name
+    if ":" in image_name_prefix:
+        image_name_prefix, _ = image_name_prefix.split(":", 1)
+    fh = context.run(
+        "docker inspect --format='{{.RepoDigests}}' %s" % (image_name,),
+        hide="both" if silent else None,
+    )
+    digests = trim(fh.stdout.strip(), "[]").split(" ")
+    if not silent:
+        print(f"Digests for {image_name}: {', '.join(digests)}")
+    return tuple(x for x in digests if x.startswith(image_name_prefix))
+
+
+@task
 def download(context: Context, /, silent: bool = False) -> Tuple[Image, ...]:
     downloaded: List[Image] = []
+    seen: Set[str] = None
     for image_sha in BASE_IMAGES_BY_SHA:
+        if image_sha is None:
+            continue
         context.run(
             f"docker pull {image_sha}", env=compose_environ(), hide="both" if silent else None
         )
         tags = BASE_IMAGES_BY_SHA[image_sha:image_sha]
         for tag in tags:
             print(f"Tagging {image_sha} -> {tag}")
+            seen.add(tag)
             context.run(f"docker tag {image_sha} {tag}", hide="both" if silent else None)
         downloaded.append(Image(image_sha, tuple(tags)))
+    for image_tag in BASE_IMAGES:
+        if BASE_IMAGES[image_tag] is None:
+            context.run(
+                f"docker pull {image_tag}", env=compose_environ(), hide="both" if silent else None
+            )
+            fh = context.run(
+                f"docker images --no-trunc --quiet {image_tag}", hide="both" if silent else None
+            )
+            fh.stdout
+
     return tuple(downloaded)
 
 
@@ -325,7 +356,7 @@ def build(
     now = datetime.datetime.utcnow().astimezone(datetime.timezone.utc).isoformat(timespec="seconds")
     images = []
     for base_image in BASE_IMAGES_BY_SHA:
-        image_name = _.image_name(context, base_image, silent=True)
+        (image_name,) = BASE_IMAGES_BY_SHA[base_image:base_image]
         if runtime:
             if not silent:
                 print("Building runtime image", file=sys.stderr)
