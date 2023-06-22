@@ -21,6 +21,8 @@ if [ 'x' = "x$IMAGES" ]; then
   echo 'no images to upload'
   exit 1
 fi
+VERSION=$(echo "$REFERENCE" | sed -e 's,.*/\(.*\),\1,')
+echo "$OWNER -> $REFERENCE -> $VERSION for ${IMAGES}"
 
 for IMAGE_NAME in $IMAGES
 do
@@ -31,9 +33,11 @@ do
       # Change all uppercase to lowercase
       IMAGE_ID=$(echo $IMAGE_ID | tr '[A-Z]' '[a-z]')
       # Strip git ref prefix from version
-      VERSION=$(echo "$REFERENCE" | sed -e 's,.*/\(.*\),\1,')
       # Strip "v" prefix from tag name
-      [[ "$REFERENCE" == "refs/tags/"* ]] && VERSION=$(echo $VERSION | sed -e 's/^v//')
+      if [[ "$REFERENCE" == "refs/tags/"* ]]; then
+        VERSION=$(echo $VERSION | sed -e 's/^v//')
+        echo "Detected tag reference, setting version to ${VERSION}"
+      fi
       # Use Docker `latest` tag convention
       [ "$VERSION" == "main" ] && VERSION=latest
       echo IMAGE_ID=$IMAGE_ID
