@@ -45,6 +45,7 @@ U = TypeVar("U")
 DEBUG_CODEGEN = "DEBUG_CODEGEN" in os.environ and os.environ["DEBUG_CODEGEN"].lower().startswith(
     ("1", "yes", "y", "on", "t")
 )
+DEFAULT_FORMAT: Literal["lines", "json", "python"] = "lines"
 
 
 class InvertedMapping(Generic[T, U], AbstractSet):
@@ -94,7 +95,6 @@ class InvertedMapping(Generic[T, U], AbstractSet):
                         keys.append(key)
                 return tuple(self[key] for key in keys)
             if key.start:
-                print("BALH", key.start, self._mapping)
                 return self._getitem_func(key.start, all=True)
             if not any((key.start, key.stop, key.step)):
                 return type(self)(self._mapping.copy())
@@ -234,13 +234,11 @@ def is_type_container(item):
     return True
 
 
-def find_this() -> types.ModuleType:
-    try:
-        return sys.modules["tasks"]
-    except KeyError:
-        from . import tasks
-
-        return tasks
+def find_this(name="tasks") -> types.ModuleType:
+    with suppress(KeyError):
+        return sys.modules[name]
+    importlib.import_module(name)
+    return sys.modules[name]
 
 
 def get_types_from(
@@ -445,6 +443,9 @@ def %(name)s%(args)s:
     _priv_format = %(format_kwarg)s
     if _priv_format not in (None, 'json', 'python', 'lines'):
         raise ValueError("Argument %(format_kwarg)s must be either None or one of 'json', 'python', 'lines'")
+    # print("Called from %(name)s%(args)s and proxied to %(name)s(%(sig_funccall)s)")
+    # if "%(name)s" == "b64encode":
+    #     print("ARJ!", type(value))
     result = _._original_%(name)s(%(sig_funccall)s)
     if silent:
         return result
@@ -492,7 +493,12 @@ def %(name)s%(args)s:
         return result
 
     if _priv_format is None:
-        _priv_format = 'lines'
+        try:
+            _priv_format = this.DEFAULT_FORMAT
+        except AttributeError:
+            _priv_format = _tasksupport.DEFAULT_FORMAT
+            print(f'WARNING: {this.__name__}.DEFAULT_FORMAT not defined (see {this.__file__!r}). Defaulting to \"lines\"', file=sys.stderr)
+            this.DEFAULT_FORMAT = _priv_format
     if _priv_format == "json":
         kwargs = {}
         if sys.stdout.isatty():
@@ -549,6 +555,8 @@ def task(callable_=None, /, **kwargs):
         this = sys.modules[task_frame.f_globals["__name__"]]
         if "this" not in task_frame.f_globals:
             task_frame.f_globals = this
+        task_frame.f_globals[f"_{__name__}"] = find_this(__name__)
+        assert this.__name__ == "tasks"
         globalns = {
             "_origin_globals_ref": task_frame.f_globals,
             "__name__": task_frame.f_globals["__name__"],
@@ -618,6 +626,10 @@ def __getattr__(name: str):
         format_key = "format"
         if format_key in inner_function_call.parameters:
             format_key = "format_"
+        try:
+            task_module_format_default = find_this().DEFAULT_FORMAT
+        except AttributeError:
+            task_module_format_default = DEFAULT_FORMAT
         format_ = inspect.Parameter(
             format_key,
             inspect.Parameter.KEYWORD_ONLY,
@@ -627,9 +639,10 @@ def __getattr__(name: str):
         if format_key not in inner_function_call.parameters:
             additional_params.append(format_)
             kwargs.setdefault("help", {})
-            kwargs["help"][
-                format_key
-            ] = f'may be one of "json", "python", "lines" (defaults to lines).'
+            kwargs["help"][format_key] = (
+                'may be one of "json", "python", or "lines" '
+                f"(defaults to {task_module_format_default!r})."
+            )
 
         # Load into the local namespace any missing annotations necessary to run with when
         # we recreate the argument signature:
@@ -645,7 +658,11 @@ def __getattr__(name: str):
         )
         if "silent" in new_signature.parameters:
             kwargs.setdefault("help", {})
-            kwargs["help"]["silent"] = "Set to reduce console output (defaults to false)"
+            silent_default = new_signature.parameters["silent"].default
+            kwargs["help"][
+                "silent"
+            ] = f"Set to reduce console output (defaults to {silent_default!r})"
+            del silent_default
 
         # Merge into the proxy module any missing deps
         module.__dict__.update(truly_local_modifications)
@@ -653,11 +670,21 @@ def __getattr__(name: str):
         module.__dict__.update(globalns)
 
         def wrap_func(func):
+            internal_wrapper_signature = reify_annotations_in(
+                localns,
+                sig.replace(
+                    parameters=(
+                        *sig.parameters.values(),
+                        *additional_params,
+                    )
+                ),
+            )
+
             ns = ChainMap({}, localns, vars(module))
             signature = inspect.signature(func)
             code = INTERNAL_WRAPPER % dict(
                 name=func.__name__,
-                args=str(new_signature),
+                args=str(internal_wrapper_signature),
                 sig_funccall=raw_param_body_from(signature),
                 format_kwarg=format_key,
             )
