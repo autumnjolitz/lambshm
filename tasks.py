@@ -514,7 +514,7 @@ def list_local_images(
 def upload(context: Context, /, repo_prefix: str, build_ref: str) -> None:
     images = list_local_images(context, "runtime")
     if images:
-        upload_script = project_root(Path, silent=True) / "scripts" / "upload-to-github.sh"
+        upload_script = _.project_root(Path, silent=True) / "scripts" / "upload-to-github.sh"
         images = " ".join(shlex.quote(image) for image in images)
         context.run(f"{upload_script!s} '{repo_prefix}' '{build_ref}' {images}")
 
