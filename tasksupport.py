@@ -26,6 +26,7 @@ from typing import (
     Mapping,
     Union,
     Type,
+    overload,
 )
 from tempfile import NamedTemporaryFile
 from invoke import task as _task
@@ -701,3 +702,72 @@ def __getattr__(name: str):
         return wrapper(callable_)
     wrapper.__name__ = f"wrapper_for_unnamed_caller"
     return wrapper
+
+
+@overload
+def trim(s: str, /, *, left: str | tuple[str, ...]) -> str:
+    ...
+
+
+@overload
+def trim(s: str, /, *, right: str | tuple[str, ...]) -> str:
+    ...
+
+
+@overload
+def trim(s: str, both: str | tuple[str, ...], /) -> str:
+    ...
+
+
+def trim(s: str, *args, left=None, right=None) -> str:
+    if not any((args, left, right)):
+        raise TypeError
+    if sum(1 for x in (args, left, right) if x) > 1:
+        raise TypeError
+    if len(args) == 1:
+        (both,) = args
+        return trim_both(s, both)
+    if left is not None:
+        return ltrim(s, left)
+    if right is not None:
+        return rtrim(s, right)
+    raise TypeError
+
+
+def ltrim(s: str, left: str | tuple[str, ...], /) -> str:
+    if not isinstance(left, (str, tuple)):
+        raise TypeError(f"left must be a str or tuple[str, ...]")
+    if isinstance(left, str):
+        left = tuple(left)
+    if s.startswith(left):
+        for index, char in enumerate(s):
+            if char in left:
+                continue
+            if index > 0:
+                s = s[index:]
+            break
+    return s
+
+
+def rtrim(s: str, right: str | tuple[str, ...], /) -> str:
+    if not isinstance(right, (str, tuple)):
+        raise TypeError(f"right must be a str or tuple[str, ...]")
+    if isinstance(right, str):
+        right = tuple(right)
+    if s.endswith(right):
+        for index in range(len(s) - 1, -1, -1):
+            char = s[index]
+            if char in right:
+                continue
+            if index < len(s):
+                s = s[: index + 1]
+            break
+    return s
+
+
+def trim_both(s: str, both: str | tuple[str, ...], /) -> str:
+    if not isinstance(both, (str, tuple)):
+        raise TypeError(f"both must be a str or tuple[str, ...]")
+    if isinstance(both, str):
+        both = tuple(both)
+    return rtrim(ltrim(s, both), both)
