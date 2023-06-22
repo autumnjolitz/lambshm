@@ -421,7 +421,7 @@ def build(
     now = datetime.datetime.utcnow().astimezone(datetime.timezone.utc).isoformat(timespec="seconds")
     images = []
     for base_image in BASE_IMAGES_BY_SHA:
-        (image_name,) = BASE_IMAGES_BY_SHA[base_image:base_image]
+        image_name = _.image_name(context, base_image, silent=True)
         if runtime:
             if not silent:
                 print("Building runtime image", file=sys.stderr)
