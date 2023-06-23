@@ -7,8 +7,7 @@ import datetime
 import builtins
 import sys
 import time
-import shlex
-from contextlib import suppress
+from contextlib import suppress, contextmanager
 from invoke.exceptions import UnexpectedExit
 from pathlib import Path
 from typing import Literal, Type, Union, Iterable, Dict, Tuple, NamedTuple, Optional, List
@@ -86,6 +85,36 @@ def compose_environ(*, copy_os_environ: bool = False, **kwargs) -> Dict[str, str
         **kwargs,
     }
     return environment
+
+
+@contextmanager
+def cd(path: str | Path):
+    if not isinstance(path, Path):
+        path = Path(path)
+    new_cwd = path.resolve()
+    prior_cwd = Path(os.getcwd()).resolve()
+    try:
+        os.chdir(new_cwd)
+        yield prior_cwd
+    finally:
+        os.chdir(prior_cwd)
+
+
+@task
+def branch_name(context: Context) -> str:
+    with suppress(KeyError):
+        return os.environ["GITHUB_REF_NAME"]
+    here = this._.project_root(Path, silent=True)
+    if (here / ".git").is_dir():
+        with suppress(FileNotFoundError):
+            return context.run(f"git -C {here!s} branch --show-current", hide="both").stdout.strip()
+        with open(here / ".git" / "HEAD") as fh:
+            for line in fh:
+                if line.startswith("ref:"):
+                    _, line = (x.strip() for x in line.split(":", 1))
+                if line.startswith("refs/heads/"):
+                    return line.removeprefix("refs/heads/")
+    raise ValueError("Unable to determine branch name!")
 
 
 @task
@@ -511,12 +540,75 @@ def list_local_images(
 
 
 @task
-def upload(context: Context, /, repo_prefix: str, build_ref: str) -> None:
+def repository_owner(context: Context, /) -> str | None:
+    owner = None
+    with suppress(KeyError):
+        owner = os.environ["GITHUB_ACTOR"]
+    if not owner:
+        with cd(this._.project_root(silent=True)):
+            git_repo_url = context.run("git remote get-url origin", hide="stdout")
+            if git_repo_url:
+                _, short_repo_url = git_repo_url.stdout.split(":", 1)
+                owner, _ = short_repo_url.split("/", 1)
+    return owner
+
+
+@task
+def upload(context: Context, /, build_ref: str = "", silent: bool = False, owner: str = "") -> None:
+    if not build_ref:
+        with suppress(KeyError):
+            build_ref = os.environ["GITHUB_REF"]
+    if not build_ref:
+        build_ref = f"refs/heads/{_.branch_name(context)}"
+        print(f"build_ref inferred from branch_name to be {build_ref}", file=sys.stderr)
+    if not owner:
+        owner = _.repository_owner(context, silent=True)
+        print(f"owner inferred to be {owner!r}")
+    if not owner:
+        raise ValueError("Unable to determine owner of repository, please specify an owner!")
     images = list_local_images(context, "runtime")
+    if build_ref.startswith("refs/tags/"):
+        tag_name = build_ref.removeprefix("refs/tags/").translate({ord("/"): ord("-")})
+        assert tag_name.lower() not in ("main", "latest", "master")
+        version = tag_name
+    elif build_ref.startswith("refs/heads/"):
+        branch_name = build_ref.removeprefix("refs/heads/").translate({ord("/"): ord("-")})
+        if branch_name == "main":
+            version = "latest"
+        else:
+            version = f"branch.{branch_name}"
+    elif build_ref.startswith("refs/pull/"):
+        print("Nothing to upload for pull requests!", file=sys.stderr)
+        return
+    else:
+        raise ValueError(f"Unrecognized build_ref {build_ref!r}")
     if images:
-        upload_script = _.project_root(Path, silent=True) / "scripts" / "upload-to-github.sh"
-        images = " ".join(shlex.quote(image) for image in images)
-        context.run(f"{upload_script!s} '{repo_prefix}' '{build_ref}' {images}")
+        t_s = time.time()
+        print(f"Begin upload of {len(images)} images")
+        for image in images:
+            _.upload_image(context, image, version, silent=silent, owner=owner)
+        print(f"Uploaded {len(images)} images in {time.time() - t_s:.2f} seconds")
+
+
+@task
+def upload_image(
+    context: Context, /, image: str, version: str, owner: str = "", silent: bool = False
+) -> None:
+    if not owner:
+        owner = _.repository_owner(context, silent=True)
+    if not owner:
+        raise ValueError("Unable to determine owner of repository, please specify an owner!")
+    image_prefix = f"ghcr.io/{owner}/{{}}:{version}"
+    image_repository = image_prefix.format(image)
+    if not silent:
+        print(f"Uploading {image} to {image_repository}", file=sys.stderr)
+    t_s = time.time()
+    context.run(f"docker tag {image} {image_repository}", hide="both" if silent else None)
+    context.run(f"docker push {image_repository}", hide="both" if silent else None)
+    if not silent:
+        print(
+            f"Uploaded {image} to {image_repository} in {time.time() - t_s:.2f}s", file=sys.stderr
+        )
 
 
 @task
