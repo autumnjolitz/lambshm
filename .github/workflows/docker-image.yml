@@ -28,5 +28,5 @@ jobs:
     - name: Log in to registry
       run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u $ --password-stdin
     - name: Push image
-      run: invoke upload --repo-prefix='${{ github.repository_owner }}' --build-ref='${{ github.ref }}'
+      run: invoke upload
 
