@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Literal, Type, Union, Iterable, Dict, Tuple, NamedTuple, Optional, List
 
 from invoke.context import Context
-from tasksupport import task, first, InvertedMapping, trim
+from tasksupport import task, first, InvertedMapping, trim, truncate
 
 _ = types.SimpleNamespace()
 this = sys.modules[__name__]
@@ -332,9 +332,10 @@ def digests_for(context: Context, image_name: str, *, silent: bool = False) -> t
         "docker inspect --format='{{.RepoDigests}}' %s" % (image_name,),
         hide="both" if silent else None,
     )
-    digests = trim(fh.stdout.strip(), "[]").split(" ")
+    digests = trim(fh.stdout.strip(), "[]").split()
     if not silent:
-        print(f"Digests for {image_name}: {', '.join(digests)}")
+        digests_friendly = ", ".join(digests) or "No digests found!"
+        print(f"Digests for {image_name}: {digests_friendly}")
     return tuple(x for x in digests if x.startswith(image_name_prefix))
 
 
@@ -449,8 +450,9 @@ def build(
     """
     now = datetime.datetime.utcnow().astimezone(datetime.timezone.utc).isoformat(timespec="seconds")
     images = []
-    for base_image in BASE_IMAGES_BY_SHA:
-        image_name = _.our_image_name_for(context, base_image, silent=True)
+    for base_image_by_digest in BASE_IMAGES_BY_SHA:
+        (base_image_name,) = BASE_IMAGES_BY_SHA[base_image_by_digest:base_image_by_digest]
+        image_name = _.our_image_name_for(context, base_image_by_digest, silent=True)
         if runtime:
             if not silent:
                 print("Building runtime image", file=sys.stderr)
@@ -458,8 +460,9 @@ def build(
                 "docker compose --ansi never "
                 "-f config/docker-compose.yml "
                 "build "
-                f"--build-arg BASE_IMAGE={base_image} "
+                f"--build-arg BASE_IMAGE={base_image_name} "
                 f"--build-arg TODAY={now} "
+                f"--build-arg BASE_IMAGE_DIGEST={base_image_by_digest} "
                 "runtime"
             )
             if not silent:
@@ -469,6 +472,7 @@ def build(
                 env=compose_environ(IMAGE_NAME=image_name),
                 hide=("both" if silent else None),
             )
+
             images.append(image_name)
         if tests:
             if not silent:
@@ -483,7 +487,8 @@ def build(
                 env=compose_environ(IMAGE_NAME=image_name),
                 hide=("both" if silent else None),
             )
-            images.append(f"{image_name}-test")
+            test_image_name = f"{image_name}-test"
+            images.append(test_image_name)
     return tuple(images)
 
 
@@ -555,51 +560,98 @@ def repository_owner(context: Context, /) -> str | None:
 
 @task
 def upload(context: Context, /, build_ref: str = "", silent: bool = False, owner: str = "") -> None:
-    if not build_ref:
-        with suppress(KeyError):
-            build_ref = os.environ["GITHUB_REF"]
-    if not build_ref:
-        build_ref = f"refs/heads/{_.branch_name(context)}"
-        print(f"build_ref inferred from branch_name to be {build_ref}", file=sys.stderr)
     if not owner:
         owner = _.repository_owner(context, silent=True)
         print(f"owner inferred to be {owner!r}")
     if not owner:
         raise ValueError("Unable to determine owner of repository, please specify an owner!")
     images = list_local_images(context, "runtime")
-    if build_ref.startswith("refs/tags/"):
-        tag_name = build_ref.removeprefix("refs/tags/").translate({ord("/"): ord("-")})
-        assert tag_name.lower() not in ("main", "latest", "master")
-        version = tag_name
-    elif build_ref.startswith("refs/heads/"):
-        branch_name = build_ref.removeprefix("refs/heads/").translate({ord("/"): ord("-")})
-        if branch_name == "main":
-            version = "latest"
-        else:
-            version = f"branch.{branch_name}"
-    elif build_ref.startswith("refs/pull/"):
-        print("Nothing to upload for pull requests!", file=sys.stderr)
-        return
-    else:
-        raise ValueError(f"Unrecognized build_ref {build_ref!r}")
+    image_tag = this._.suggest_image_tag(context, build_ref, silent=True)
     if images:
         t_s = time.time()
         print(f"Begin upload of {len(images)} images")
         for image in images:
-            _.upload_image(context, image, version, silent=silent, owner=owner)
+            _.upload_image(
+                context, image, image_tag, silent=silent, owner=owner, build_ref=build_ref
+            )
+            commit_sha = this._.commit_sha(context)
+            if commit_sha:
+                _.upload_image(
+                    context,
+                    image,
+                    f"commit.{commit_sha}",
+                    silent=silent,
+                    owner=owner,
+                    build_ref=build_ref,
+                )
         print(f"Uploaded {len(images)} images in {time.time() - t_s:.2f} seconds")
 
 
 @task
+def commit_sha(context: Context, /):
+    with suppress(KeyError):
+        return os.environ["GITHUB_SHA"]
+    here = this._.project_root(Path, silent=True)
+    if (here / ".git").is_dir():
+        with suppress(FileNotFoundError):
+            return context.run(f"git -C {here!s} rev-parse HEAD", hide="both").stdout.strip()
+    raise ValueError("Unable to deduce commit_sha!")
+
+
+@task
+def build_ref(context: Context, /, ref: str = "", silent: bool = True) -> str | None:
+    if not ref:
+        with suppress(KeyError):
+            ref = os.environ["GITHUB_REF"]
+    if not ref:
+        ref = f"refs/heads/{_.branch_name(context, silent=TabError)}"
+        print(f"ref inferred from branch_name to be {ref}", file=sys.stderr)
+    if not ref.startswith("refs/"):
+        raise ValueError(f'References (ref) must start with "ref/", not {truncate(ref, 10)!r}')
+    return ref
+
+
+@task
+def suggest_image_tag(context: Context, /, ref: str = "") -> str:
+    """
+    Attempt to deduce the probable image tag name using the current build references available.
+    """
+    ref = _.build_ref(context, ref)
+    if ref is None:
+        return None
+    if ref.startswith("refs/tags/"):
+        tag_name = ref.removeprefix("refs/tags/").translate({ord("/"): ord("-")})
+        assert tag_name.lower() not in ("main", "latest", "master")
+        image_tag = f"tags.{tag_name}"
+    elif ref.startswith("refs/heads/"):
+        branch_name = ref.removeprefix("refs/heads/").translate({ord("/"): ord("-")})
+        if branch_name == "main":
+            image_tag = "latest"
+        else:
+            image_tag = f"branch.{branch_name}"
+    elif ref.startswith("refs/pull/"):
+        pull_request: int = int(ref.removeprefix("refs/pull/").removesuffix("/merge"), 10)
+        image_tag = f"pr.{pull_request}"
+    else:
+        raise ValueError(f"Unrecognized ref {ref!r}")
+    return truncate(image_tag, 128, trailer="")
+
+
+@task
 def upload_image(
-    context: Context, /, image: str, version: str, owner: str = "", silent: bool = False
+    context: Context,
+    /,
+    image: str,
+    tag: str,
+    owner: str = "",
+    silent: bool = False,
+    build_ref: str = "",
 ) -> None:
     if not owner:
         owner = _.repository_owner(context, silent=True)
     if not owner:
         raise ValueError("Unable to determine owner of repository, please specify an owner!")
-    image_prefix = f"ghcr.io/{owner}/{{}}:{version}"
-    image_repository = image_prefix.format(image)
+    image_repository = _.show_image_uri_for(context, image, owner, build_ref, tag)
     if not silent:
         print(f"Uploading {image} to {image_repository}", file=sys.stderr)
     t_s = time.time()
@@ -609,6 +661,33 @@ def upload_image(
         print(
             f"Uploaded {image} to {image_repository} in {time.time() - t_s:.2f}s", file=sys.stderr
         )
+
+
+@task
+def show_image_uri_for(
+    context: Context, /, local_image: str, owner: str = "", build_ref: str = "", tag: str = ""
+) -> str:
+    """
+    Deduce the fully qualified image repository url for a given image.
+
+    owner: the repostory organization/owner. If empty, will deduce from the origin url.
+    build_ref: the build reference. If empty, will deduce from the branch.
+    """
+    digests = _.digests_for(context, local_image, silent=True)
+    if digests:
+        # Not a local build!
+        return this._.get_tags_from(context, digests[0], silent=True)[0]
+    # local build!
+    if not owner:
+        owner = _.repository_owner(context, silent=True)
+    if not owner:
+        raise ValueError("Unable to determine owner of repository, please specify an owner!")
+    build_ref = this._.build_ref(context, build_ref, silent=True)
+    if not tag:
+        tag = this._.suggest_image_tag(context, build_ref, silent=True)
+    if tag:
+        return f"ghcr.io/{owner}/{local_image}:{tag}"
+    raise ValueError(f"Unable to deduce image uri for {local_image!r}")
 
 
 @task
