@@ -82,6 +82,7 @@ def compose_environ(*, copy_os_environ: bool = False, **kwargs) -> Dict[str, str
         "BUILDX_GIT_LABELS": "full",
         "BUILDKIT_PROGRESS": "plain",
         "DOCKER_BUILDKIT": "1",
+        "COMPOSE_PROJECT_NAME": "lambshm",
         **kwargs,
     }
     return environment
