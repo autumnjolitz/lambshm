@@ -331,7 +331,10 @@ def digests_for(context: Context, image_name: str, *, silent: bool = False) -> t
     fh = context.run(
         "docker inspect --format='{{.RepoDigests}}' %s" % (image_name,),
         hide="both" if silent else None,
+        warn=True,
     )
+    if "No such object:" in fh.stderr:
+        return ()
     digests = trim(fh.stdout.strip(), "[]").split()
     if not silent:
         digests_friendly = ", ".join(digests) or "No digests found!"
@@ -340,7 +343,7 @@ def digests_for(context: Context, image_name: str, *, silent: bool = False) -> t
 
 
 @task
-def download(context: Context, /, silent: bool = False) -> Tuple[Image, ...]:
+def download(context: Context, /, silent: bool = False, build_ref: str = "") -> Tuple[Image, ...]:
     downloaded: List[Image] = []
     for image_sha in BASE_IMAGES_BY_SHA:
         if image_sha is None:
@@ -363,6 +366,17 @@ def download(context: Context, /, silent: bool = False) -> Tuple[Image, ...]:
             if not silent:
                 print(f"Assigning {image_sha} to {image_tag} for this run", file=sys.stderr)
             BASE_IMAGES[image_tag] = image_sha
+    for our_image in _.all_image_names(context):
+        image_tag = this._.suggest_image_tag(context, build_ref, silent=True)
+        for tag in (
+            image_tag,
+            f"commit.{_.commit_sha(context)}",
+            f"commit.{_.commit_sha(context, -1)}",
+        ):
+            uri = _.show_image_uri_for(context, our_image, build_ref=build_ref, tag=tag)
+            result = context.run(f"docker pull {uri}", warn=True)
+            if not result:
+                print(f"Unable to pull {uri}: {result.stderr}.", file=sys.stderr)
     return tuple(downloaded)
 
 
@@ -437,7 +451,7 @@ def all_image_names(
     """
     images = []
     for base_image in BASE_IMAGES_BY_SHA:
-        images.append(image_name(context, base_image, silent=True))
+        images.append(our_image_name_for(context, base_image, silent=True))
     return tuple(images)
 
 
@@ -588,13 +602,15 @@ def upload(context: Context, /, build_ref: str = "", silent: bool = False, owner
 
 
 @task
-def commit_sha(context: Context, /):
+def commit_sha(context: Context, /, depth: int = 0):
     with suppress(KeyError):
         return os.environ["GITHUB_SHA"]
     here = this._.project_root(Path, silent=True)
     if (here / ".git").is_dir():
         with suppress(FileNotFoundError):
-            return context.run(f"git -C {here!s} rev-parse HEAD", hide="both").stdout.strip()
+            fh = context.run(f"git -C {here!s} rev-parse HEAD~{abs(depth)}", hide="both", warn=True)
+            if fh:
+                return fh.stdout.strip()
     raise ValueError("Unable to deduce commit_sha!")
 
 
