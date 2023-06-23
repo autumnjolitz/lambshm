@@ -1,5 +1,3 @@
-ARG TODAY
-ARG BASE_IMAGE
 ARG BASE_IMAGE_DIGEST
 FROM $BASE_IMAGE_DIGEST AS builder
 
@@ -18,6 +16,10 @@ RUN patch-libc.py --shm-folder $SHM_FOLDER_PREFIX --copy-to /usr/obj/root && \
     chmod u+rwx,g+rx,o+rx /usr/obj/root/opt/lambshm/bin/*
 
 FROM $BASE_IMAGE_DIGEST
+ARG TODAY
+ARG BASE_IMAGE
+ARG BASE_IMAGE_DIGEST
+
 ENV AWS_LAMBDA_EXEC_WRAPPER='/opt/lambshm/bin/bootstrap'
 COPY --from=builder /usr/obj/root /
 
