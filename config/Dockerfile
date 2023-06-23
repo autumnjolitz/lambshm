@@ -16,7 +16,6 @@ RUN patch-libc.py --shm-folder $SHM_FOLDER_PREFIX --copy-to /usr/obj/root && \
     chmod u+rwx,g+rx,o+rx /usr/obj/root/opt/lambshm/bin/*
 
 FROM $BASE_IMAGE_DIGEST
-ARG TODAY
 ARG BASE_IMAGE
 ARG BASE_IMAGE_DIGEST
 
@@ -27,6 +26,5 @@ LABEL org.opencontainers.image.authors="lambshm developers <autumn.jolitz+lambsh
       org.opencontainers.image.source="https://github.com/autumnjolitz/lambshm" \
       org.opencontainers.image.title="LambSHM" \
       org.opencontainers.image.description="Patched libc for common Python images used in Lambda" \
-      org.opencontainers.image.created=$TODAY \
       org.opencontainers.image.base.digest=$BASE_IMAGE_DIGEST \
       org.opencontainers.image.base.name=$BASE_IMAGE
