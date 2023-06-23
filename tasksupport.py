@@ -564,6 +564,7 @@ def task(callable_=None, /, **kwargs):
             "__builtins__": builtins,
             "__file__": filename,
             "ModuleType": types.ModuleType,
+            "Any": Any,
         }
         # populate global ns with a chain map:
         truly_local_modifications = {}
@@ -770,9 +771,10 @@ def ltrim(s: str, left: str | tuple[str, ...], /) -> str:
         for index, char in enumerate(s):
             if char in left:
                 continue
-            if index > 0:
-                s = s[index:]
+            s = s[index:]
             break
+        else:
+            return ""
     return s
 
 
@@ -786,9 +788,10 @@ def rtrim(s: str, right: str | tuple[str, ...], /) -> str:
             char = s[index]
             if char in right:
                 continue
-            if index < len(s):
-                s = s[: index + 1]
+            s = s[: index + 1]
             break
+        else:
+            return ""
     return s
 
 
@@ -798,3 +801,11 @@ def trim_both(s: str, both: str | tuple[str, ...], /) -> str:
     if isinstance(both, str):
         both = tuple(both)
     return rtrim(ltrim(s, both), both)
+
+
+def truncate(s: str, /, limit: int, *, trailer: str = "…") -> str:
+    if len(s) <= limit:
+        return s
+    if trailer:
+        return s[: limit - 1] + trailer
+    return s[:limit]
