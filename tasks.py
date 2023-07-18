@@ -22,7 +22,7 @@ BASE_IMAGES: dict[str, str | None] = {
     # python:3.8
     f"{AWS_LAMBDA_REPO}:3.8": f"{AWS_LAMBDA_REPO}@sha256:a04abc05330a09c239c3e3d62408dd8331c5b3e3ee323a3d8a29cb0fad4d5356",
     # python:3.9
-    # f"{AWS_LAMBDA_REPO}:3.9": f"{AWS_LAMBDA_REPO}@sha256:24c5f5135c69f00ff9e43c320b7602177f390ed6637ac00f07272e812a286dc4",
+    f"{AWS_LAMBDA_REPO}:3.9": f"{AWS_LAMBDA_REPO}@sha256:696a74214bac1cf4afe6427331c6fc609c8b58a343f62e0ed9e3a483f120d1f1",
 }
 BASE_IMAGES_BY_SHA = InvertedMapping(BASE_IMAGES)
 IMAGE_DIGEST_CACHE_TTL: int | float = 5 * 60
@@ -458,7 +458,11 @@ def all_image_names(
 
 @task
 def build(
-    context, runtime: bool = True, tests: bool = True, silent: bool = False
+    context,
+    runtime: bool = True,
+    tests: bool = True,
+    silent: bool = False,
+    override_image_name: Optional[str] = None,
 ) -> Tuple[str, ...]:
     """
     Patch the images to have a writeable libc shm_open(2) directory compatible with Python
@@ -467,6 +471,9 @@ def build(
     images = []
     for base_image_by_digest in BASE_IMAGES_BY_SHA:
         (base_image_name,) = BASE_IMAGES_BY_SHA[base_image_by_digest:base_image_by_digest]
+        if override_image_name is not None and base_image_name != override_image_name:
+            print(f"{base_image_name} != {override_image_name}, skipping", file=sys.stderr)
+            continue
         image_name = _.our_image_name_for(context, base_image_by_digest, silent=True)
         if runtime:
             if not silent:
@@ -508,7 +515,12 @@ def build(
 
 
 @task
-def test(context: Context, as_server: bool = False, silent: bool = False) -> bool:
+def test(
+    context: Context,
+    as_server: bool = False,
+    silent: bool = False,
+    override_image_name: Optional[str] = None,
+) -> bool:
     """
     Run a test that should just pass. If it doesn't, it means the image is borked
 
@@ -516,6 +528,10 @@ def test(context: Context, as_server: bool = False, silent: bool = False) -> boo
     """
     for image_sha in BASE_IMAGES_BY_SHA:
         image_name = _.our_image_name_for(context, image_sha, silent=True)
+        if override_image_name is not None and image_name != override_image_name:
+            print(f"{image_name} != {override_image_name}, skipping", file=sys.stderr)
+            continue
+
         env = compose_environ(IMAGE_NAME=image_name)
         if as_server:
             result = context.run(
