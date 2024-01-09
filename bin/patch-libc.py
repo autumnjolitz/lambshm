@@ -47,15 +47,16 @@ def main(
 
 
 def patch_library(path: Path, shm_folder: Optional[str] = None) -> Optional[ELF]:
-    if not path.name.startswith(("ld-linux", "libpthread")):
-        return
     if shm_folder is None:
         shm_folder = "/tmp/shm/"
+    if not path.name.startswith(("ld-linux", "libpthread", "libc.so")):
+        return
     library = ELF(path)
     has_default_dir = "defaultdir" in library.symbols
+    has_shm_getname = "__shm_get_name" in library.functions
     has_where_is_shmfs = "where_is_shmfs" in library.functions
 
-    if any((has_default_dir, has_where_is_shmfs)):
+    if any((has_default_dir, has_where_is_shmfs, has_shm_getname)):
         print(f"opening {path}", file=sys.stderr)
         if has_default_dir:
             current_default = (
@@ -80,6 +81,13 @@ def patch_library(path: Path, shm_folder: Optional[str] = None) -> Optional[ELF]
                 library.disasm(whereis_shmfs.address, whereis_shmfs.size),
                 file=sys.stderr,
             )
+        if has_shm_getname:
+            read_only = library.section(".rodata")
+            if b"/dev/shm" in read_only:
+                for vaddr in library.search(b"/dev/shm"):
+                    s = library.string(vaddr)
+                    print(s)
+                    library.write(vaddr, shm_folder.encode())
 
         return library
 
@@ -115,7 +123,7 @@ def traverse_tree(
             continue
         with open(file, "rb") as fh:
             header = fh.read(16)
-            if not header.startswith(b"\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00"):
+            if not header.startswith(b"\x7fELF\x02\x01"):
                 continue
         yield file
     for file in dirs:

@@ -18,12 +18,15 @@ from tasksupport import task, first, InvertedMapping, trim, truncate
 _ = types.SimpleNamespace()
 this = sys.modules[__name__]
 AWS_LAMBDA_REPO = "public.ecr.aws/lambda/python"
+DOCKER_PYTHON = "docker.io/python"
 BASE_IMAGES: dict[str, str | None] = {
     # python:3.8
     f"{AWS_LAMBDA_REPO}:3.8": f"{AWS_LAMBDA_REPO}@sha256:a04abc05330a09c239c3e3d62408dd8331c5b3e3ee323a3d8a29cb0fad4d5356",
     # python:3.9
     f"{AWS_LAMBDA_REPO}:3.9": f"{AWS_LAMBDA_REPO}@sha256:696a74214bac1cf4afe6427331c6fc609c8b58a343f62e0ed9e3a483f120d1f1",
+    f"{DOCKER_PYTHON}:3.9-bookworm": f"{DOCKER_PYTHON}@sha256:1fcc3e2d0128c39c20eb34e1a094c66f78cbea1de52428e0a5a82588bf0d50c7",
 }
+FLAVORS = {"apt-get": "debian", "yum": "redhat"}
 BASE_IMAGES_BY_SHA = InvertedMapping(BASE_IMAGES)
 IMAGE_DIGEST_CACHE_TTL: int | float = 5 * 60
 EMPTY_MAPPING = {}
@@ -424,7 +427,10 @@ def our_image_name_for(
     results = []
     skip_tag = frozenset(skip_tag)
     for base_image in image_tags:
-        _, image = base_image.rsplit("/", 1)
+        if "/" in base_image:
+            _, image = base_image.rsplit("/", 1)
+        else:
+            image = base_image
         tag_name = ""
         with suppress(ValueError):
             image, tag_name = image.split(":")
@@ -457,6 +463,21 @@ def all_image_names(
 
 
 @task
+def get_flavor_for(context, image_sha):
+    for package_manager in FLAVORS:
+        try:
+            result = context.run(
+                f'docker run --rm --entrypoint /bin/sh -t {image_sha} -c "{package_manager} --help"',
+                hide="both",
+            )
+        except UnexpectedExit:
+            continue
+        else:
+            return FLAVORS[package_manager]
+    raise LookupError
+
+
+@task
 def build(
     context,
     runtime: bool = True,
@@ -475,6 +496,7 @@ def build(
             print(f"{base_image_name} != {override_image_name}, skipping", file=sys.stderr)
             continue
         image_name = _.our_image_name_for(context, base_image_by_digest, silent=True)
+        flavor = _.get_flavor_for(context, base_image_by_digest, silent=True)
         if runtime:
             if not silent:
                 print("Building runtime image", file=sys.stderr)
@@ -491,7 +513,7 @@ def build(
                 print(f"Running {path!r} {image_name!r}", file=sys.stderr)
             context.run(
                 path,
-                env=compose_environ(IMAGE_NAME=image_name),
+                env=compose_environ(IMAGE_NAME=image_name, FLAVOR=flavor),
                 hide=("both" if silent else None),
             )
 
@@ -506,7 +528,7 @@ def build(
                 f"--build-arg BASE_IMAGE={image_name} "
                 f"--build-arg TODAY={now} "
                 "runtime",
-                env=compose_environ(IMAGE_NAME=image_name),
+                env=compose_environ(IMAGE_NAME=image_name, FLAVOR=flavor),
                 hide=("both" if silent else None),
             )
             test_image_name = f"{image_name}-test"
@@ -531,8 +553,8 @@ def test(
         if override_image_name is not None and image_name != override_image_name:
             print(f"{image_name} != {override_image_name}, skipping", file=sys.stderr)
             continue
-
-        env = compose_environ(IMAGE_NAME=image_name)
+        flavor = _.get_flavor_for(context, image_sha, silent=True)
+        env = compose_environ(IMAGE_NAME=image_name, FLAVOR=flavor)
         if as_server:
             result = context.run(
                 "docker compose --ansi never "

@@ -4,5 +4,5 @@ services:
   runtime:
     image: "${IMAGE_NAME}"
     build:
-      dockerfile: config/Dockerfile
+      dockerfile: "config/Dockerfile.${FLAVOR}"
       context: '..'
